@@ -40,7 +40,7 @@ RobloxExporter/
 
 ### 2. Start the export server
 
-Open a terminal in the folder and run:
+Open a terminal in the folder (for example cd ~/RobloxExporter) and run:
 
 python3 export_server.py
 
@@ -56,10 +56,8 @@ Leave this terminal running.
 ### 3. Install the Studio plugin
 
 In Roblox Studio:
-1. Open **Plugins**
-2. Click **Manage Plugins**
-3. Click **Import Plugin**
-4. Select `roblox_exporter.plugin.lua`
+1. Open **Plugins Folder**
+2. Select `roblox_exporter.plugin.lua`
 
 A toolbar button called **Roblox Exporter** will appear.
 
@@ -99,5 +97,6 @@ If the folder already exists, files are **overwritten**, not duplicated.
 - You can delete the `MyGame` folder at any time and re-export
 - Script names with invalid filesystem characters are skipped
 - Export is safe and read-only (no Studio data is modified)
+- Please create new folders for other games, else it may all merge
 
 ---
