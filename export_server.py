@@ -11,10 +11,13 @@ import http.server
 import json
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 HOST = "127.0.0.1"
 PORT = 34873
 EXPORT_ROUTE = "/export"
+MANIFEST_ROUTE = "/manifest"
+FILE_ROUTE = "/file"
 PROJECT_ROOT = "MyGame"
 BASE_DIR = Path(os.getcwd()).resolve()
 
@@ -69,6 +72,34 @@ def build_target(record):
     return folder / filename, source
 
 
+def project_src_root():
+    return BASE_DIR / PROJECT_ROOT / "src"
+
+
+def is_within_root(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def infer_script_type(filename):
+    if filename.endswith(".server.luau"):
+        return "Script", filename[: -len(".server.luau")]
+    if filename.endswith(".client.luau"):
+        return "LocalScript", filename[: -len(".client.luau")]
+    if filename.endswith(".luau"):
+        return "ModuleScript", filename[: -len(".luau")]
+    return None, None
+
+
+def safe_relpath(path, root):
+    rel = path.relative_to(root)
+    # Always use forward slashes for URLs.
+    return rel.as_posix()
+
+
 class ExportHandler(http.server.BaseHTTPRequestHandler):
     def _send_json(self, status_code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -79,63 +110,178 @@ class ExportHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path != EXPORT_ROUTE:
-            self._send_json(404, {"error": "Not found"})
-            return
-
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_json(400, {"error": "Invalid Content-Length"})
-            return
+            if self.path != EXPORT_ROUTE:
+                self._send_json(404, {"error": "Not found"})
+                return
 
-        raw_body = self.rfile.read(length)
-
-        try:
-            payload = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send_json(400, {"error": "Request body must be valid JSON"})
-            return
-
-        if not isinstance(payload, dict):
-            self._send_json(400, {"error": "JSON body must be an object"})
-            return
-
-        scripts = payload.get("scripts")
-        if not isinstance(scripts, list):
-            self._send_json(400, {"error": "scripts must be an array"})
-            return
-
-        exported = 0
-        errors = []
-
-        for i, record in enumerate(scripts):
-            if not isinstance(record, dict):
-                errors.append(f"scripts[{i}] must be an object")
-                continue
             try:
-                target_file, source = build_target(record)
-                with target_file.open("w", encoding="utf-8", newline="") as file_handle:
-                    file_handle.write(source)
-                exported += 1
-            except ValueError as exc:
-                errors.append(f"scripts[{i}]: {exc}")
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json(400, {"error": "Invalid Content-Length"})
+                return
 
-        print(f"Exported {exported} scripts")
-        if errors:
-            print(f"Skipped {len(errors)} invalid entries")
+            raw_body = self.rfile.read(length)
 
-        self._send_json(
-            200,
-            {
-                "exported": exported,
-                "skipped": len(errors),
-                "errors": errors,
-            },
-        )
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "Request body must be valid JSON"})
+                return
+
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "JSON body must be an object"})
+                return
+
+            scripts = payload.get("scripts")
+            if not isinstance(scripts, list):
+                self._send_json(400, {"error": "scripts must be an array"})
+                return
+
+            exported = 0
+            errors = []
+
+            for i, record in enumerate(scripts):
+                if not isinstance(record, dict):
+                    errors.append(f"scripts[{i}] must be an object")
+                    continue
+                try:
+                    target_file, source = build_target(record)
+                    with target_file.open("w", encoding="utf-8", newline="") as file_handle:
+                        file_handle.write(source)
+                    exported += 1
+                except ValueError as exc:
+                    errors.append(f"scripts[{i}]: {exc}")
+
+            print(f"Exported {exported} scripts")
+            if errors:
+                print(f"Skipped {len(errors)} invalid entries")
+
+            self._send_json(
+                200,
+                {
+                    "exported": exported,
+                    "skipped": len(errors),
+                    "errors": errors,
+                },
+            )
+        except Exception as exc:  # Defensive: keep server alive.
+            print(f"[ERROR] POST /export failed: {exc}")
+            try:
+                self._send_json(500, {"error": "Internal server error"})
+            except Exception:
+                pass
 
     def do_GET(self):
-        self._send_json(405, {"error": "Use POST /export"})
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == MANIFEST_ROUTE:
+                self._handle_manifest(parsed)
+                return
+            if parsed.path == FILE_ROUTE:
+                self._handle_file(parsed)
+                return
+            self._send_json(405, {"error": "Use POST /export"})
+        except Exception as exc:  # Defensive: keep server alive.
+            print(f"[ERROR] GET {self.path} failed: {exc}")
+            try:
+                self._send_json(500, {"error": "Internal server error"})
+            except Exception:
+                pass
+
+    def _handle_manifest(self, parsed):
+        params = parse_qs(parsed.query)
+        project_root = params.get("projectRoot", [None])[0]
+        if project_root != PROJECT_ROOT:
+            self._send_json(400, {"error": "Invalid projectRoot"})
+            return
+
+        root = project_src_root()
+        if not root.exists():
+            self._send_json(404, {"error": "Project src folder not found"})
+            return
+
+        entries = []
+        skipped = 0
+
+        for path in root.rglob("*.luau"):
+            if not path.is_file():
+                continue
+            script_type, script_name = infer_script_type(path.name)
+            if not script_type:
+                continue
+
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                skipped += 1
+                continue
+
+            parts = list(rel.parts)
+            if len(parts) < 2:
+                skipped += 1
+                continue
+
+            service = parts[0]
+            folder_parts = parts[1:-1]
+
+            try:
+                sanitize_segment(service, "service")
+                for part in folder_parts:
+                    sanitize_segment(part, "path[]")
+                sanitize_segment(script_name, "name")
+            except ValueError:
+                skipped += 1
+                continue
+
+            entries.append(
+                {
+                    "service": service,
+                    "path": folder_parts,
+                    "name": script_name,
+                    "type": script_type,
+                    "relFile": safe_relpath(path, root),
+                }
+            )
+
+        # Return a plain list per spec; logs keep skip info.
+        if skipped:
+            print(f"Manifest skipped {skipped} invalid paths")
+        self._send_json(200, entries)
+
+    def _handle_file(self, parsed):
+        params = parse_qs(parsed.query)
+        project_root = params.get("projectRoot", [None])[0]
+        if project_root != PROJECT_ROOT:
+            self._send_json(400, {"error": "Invalid projectRoot"})
+            return
+
+        rel_file = params.get("relFile", [None])[0]
+        if not rel_file or not isinstance(rel_file, str):
+            self._send_json(400, {"error": "Missing relFile"})
+            return
+
+        rel_file = unquote(rel_file)
+        if rel_file.startswith("/") or rel_file.startswith("\\"):
+            self._send_json(400, {"error": "Invalid relFile"})
+            return
+
+        root = project_src_root()
+        target = (root / rel_file).resolve()
+        if not is_within_root(target, root.resolve()):
+            self._send_json(400, {"error": "Invalid relFile"})
+            return
+        if not target.exists() or not target.is_file():
+            self._send_json(404, {"error": "File not found"})
+            return
+
+        try:
+            source = target.read_text(encoding="utf-8")
+        except OSError:
+            self._send_json(500, {"error": "Failed to read file"})
+            return
+
+        self._send_json(200, {"source": source})
 
     def log_message(self, fmt, *args):
         # Keep request logs visible in the terminal.
@@ -143,7 +289,7 @@ class ExportHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    server = http.server.HTTPServer((HOST, PORT), ExportHandler)
+    server = http.server.ThreadingHTTPServer((HOST, PORT), ExportHandler)
     print(f"Listening on http://{HOST}:{PORT}{EXPORT_ROUTE}")
     print(f"Writing exports under: {BASE_DIR / PROJECT_ROOT}")
     try:
