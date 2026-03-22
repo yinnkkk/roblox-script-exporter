@@ -2,6 +2,7 @@
 -- Scans DataModel scripts and sends one JSON payload to localhost.
 
 local HttpService = game:GetService("HttpService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
 
 local BASE_URL = "http://127.0.0.1:34873"
 local EXPORT_URL = BASE_URL .. "/export"
@@ -13,6 +14,12 @@ local SCRIPT_TYPES = {
 	Script = true,
 	LocalScript = true,
 	ModuleScript = true,
+}
+
+local SCRIPT_CLASS_BY_TYPE = {
+	Script = "Script",
+	LocalScript = "LocalScript",
+	ModuleScript = "ModuleScript",
 }
 
 local toolbar = plugin:CreateToolbar("Roblox Exporter")
@@ -172,7 +179,7 @@ local function http_get_file(rel_file: string)
 	return data.source, nil
 end
 
-local function find_target_instance(entry)
+local function ensure_target_instance(entry)
 	local service = game:FindFirstChild(entry.service)
 	if not service then
 		return nil, "missing service"
@@ -182,14 +189,23 @@ local function find_target_instance(entry)
 	for _, part in ipairs(entry.path or {}) do
 		local child = current:FindFirstChild(part)
 		if not child then
-			return nil, "missing folder path"
+			child = Instance.new("Folder")
+			child.Name = part
+			child.Parent = current
 		end
 		current = child
 	end
 
 	local target = current:FindFirstChild(entry.name)
 	if not target then
-		return nil, "missing script"
+		local class_name = SCRIPT_CLASS_BY_TYPE[entry.type]
+		if not class_name then
+			return nil, "invalid script type"
+		end
+
+		target = Instance.new(class_name)
+		target.Name = entry.name
+		target.Parent = current
 	end
 	if target.ClassName ~= entry.type then
 		return nil, "type mismatch"
@@ -218,11 +234,14 @@ local function run_import()
 	local total = #files
 	local imported = 0
 	local skipped = 0
+	local changed = 0
 	local reasons = {}
 	local skipped_examples = {}
 
+	ChangeHistoryService:SetWaypoint("Roblox Exporter Import Start")
+
 	for _, entry in ipairs(files) do
-		local target, reason = find_target_instance(entry)
+		local target, reason = ensure_target_instance(entry)
 		if not target then
 			skipped += 1
 			reasons[reason] = (reasons[reason] or 0) + 1
@@ -255,6 +274,7 @@ local function run_import()
 
 		if ok then
 			imported += 1
+			changed += 1
 		else
 			skipped += 1
 			reasons["source set failed"] = (reasons["source set failed"] or 0) + 1
@@ -267,6 +287,10 @@ local function run_import()
 				tostring(set_err)
 			))
 		end
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Roblox Exporter Import Complete")
 	end
 
 	print(("[RobloxExporter] Import complete. Total=%d Imported=%d Skipped=%d"):format(
